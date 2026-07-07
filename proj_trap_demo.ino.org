@@ -1,0 +1,247 @@
+// 5Vピンから給電時にはSerial関連の処理をコメントアウトすること
+
+#include <Arduino.h>
+#include <driver/rtc_io.h>
+#include <esp_wifi.h>
+#include <esp_bt.h>
+#include <esp_bt_main.h>
+#include <time.h>
+#include "lora.h"
+
+#define WAKEUP_PIN GPIO_NUM_33
+#define TRAP_PIN GPIO_NUM_26
+
+const int lmid_own = 1;
+const int lmid_parent = 0;
+const int scount = 1;
+
+struct Trap {
+    const uint8_t sid = 1;
+    const uint8_t type = 0xC1;
+    uint8_t value;
+} trap;
+
+RTC_DATA_ATTR bool data_sent_flag = false;
+RTC_DATA_ATTR time_t data_sent_flag_start = 0;
+
+const time_t DATA_SENT_FLAG_HOLD_SEC = 30; // あとで変更
+
+void initialize_esp32() {
+    setCpuFrequencyMhz(80);
+
+    const int pins_to_disable[] = {0, 2, 4, 12, 13, 14, 15, 18, 19, 21, 22, 23, 25, 27, 32};
+    for (int pin : pins_to_disable) {
+        pinMode(pin, INPUT_PULLDOWN);
+    }
+
+    esp_wifi_stop();
+    esp_wifi_deinit();
+
+    btStop();
+    esp_bluedroid_disable();
+    esp_bluedroid_deinit();
+    esp_bt_controller_disable();
+    esp_bt_controller_deinit();
+    
+    rtc_gpio_init(WAKEUP_PIN);
+    rtc_gpio_set_direction(WAKEUP_PIN, RTC_GPIO_MODE_INPUT_ONLY);
+    rtc_gpio_pullup_dis(WAKEUP_PIN);
+    rtc_gpio_pulldown_en(WAKEUP_PIN);
+
+    Serial.begin(115200);
+}
+
+void update_data_sent_flag() {
+    if (!data_sent_flag || data_sent_flag_start == 0) {
+        return;
+    }
+
+    time_t now = time(nullptr);
+    if (now != (time_t)0 && (now - data_sent_flag_start) >= DATA_SENT_FLAG_HOLD_SEC) {
+        Serial.println("data_sent_flag expired -> false");
+        data_sent_flag = false;
+        data_sent_flag_start = 0;
+    }
+}
+
+void setup() {
+    initialize_esp32();
+
+    lora_serial_begin();
+
+    esp_sleep_wakeup_cause_t wakeup_reason;
+    wakeup_reason = esp_sleep_get_wakeup_cause();
+    Serial.printf("Wakeup reason: %d\r\n", wakeup_reason);
+    update_data_sent_flag();
+    
+    switch (wakeup_reason) {
+        case ESP_SLEEP_WAKEUP_EXT0: {
+            unsigned long pulse_wait = millis();
+            while (rtc_gpio_get_level(WAKEUP_PIN) == 1 && (millis() - pulse_wait) < 3000) {
+                delay(10);
+            }
+
+            Serial.printf("ESP_SLEEP_WAKEUP_EXT0: WAKEUP_PIN level=%d\r\n", rtc_gpio_get_level(WAKEUP_PIN));
+
+            delay(500);
+            flush_buffer();
+
+            if (data_sent_flag) {
+                Serial.println("Data already sent; stay asleep until timeout expires.");
+                send_break_signal();
+                break;
+            }
+
+            set_destination(lmid_parent); // ここ受信側からIDの送信を待ってセットするようにする
+            Payload payload;
+            make_payload(&payload);
+            set_payload(&payload);
+            Serial.println("Payload parsed & ready to send");
+
+            int backoff_time = esp_random() % 8 * 128;
+            Serial.printf("Backoff time: %d ms\r\n", backoff_time);
+            delay(backoff_time);
+
+            for (int i = 0; i < 3; i++) {
+                if (send() < 0) {
+                    Serial.println("Failed to send data");
+                    break;
+                }
+                Serial.println("Data sent, waiting for ACK...");
+                if (recv_ack() > 0) {
+                    // データ送信済みのフラグを立てる
+                    data_sent_flag = true;
+                    data_sent_flag_start = time(nullptr);
+                    Serial.printf("data_sent_flag set true at %lu\r\n", (unsigned long)data_sent_flag_start);
+                    break;
+                }
+                send_break_signal();
+            }
+            break;
+        }
+        default:
+            initialize_lora_module(lmid_own);
+            break;
+    }
+    recv_preamble();
+    esp_sleep();
+}
+
+void loop() {
+}
+
+uint8_t sense() {
+    rtc_gpio_hold_dis(TRAP_PIN);
+    pinMode(TRAP_PIN, INPUT_PULLUP);
+    delay(100);
+    if (digitalRead(TRAP_PIN) == HIGH) {
+        // 導通していない->罠が作動している
+        return 1;
+    } else {
+        // 導通している->罠が作動していない
+        return 0;
+    }
+}
+
+// raspiに合わせて追加、変更必要
+int validate_packet(const char *input, size_t input_len) {
+    if (input_len < 5) {
+        printf("validate_packet: too short input\n");
+        return -1;
+    }
+
+    if (input[0] != 'T' || input[1] != 'G') {
+        printf("validate_packet: invalid header\n");
+        return -1;
+    }
+
+    if (input[2] != input_len - 3) {
+        printf("validate_packet: length mismatch (declared=%u expected=%zu)\n", (unsigned)input[2], input_len - 3);
+        return -1;
+    }
+
+    int checksum = 0;
+    for (size_t i = 0; i < input_len - 1; i++) {
+        checksum += (unsigned char)input[i];
+    }
+    if ((checksum & 0xFF) != (unsigned char)input[input_len - 1]) {
+        printf("validate_packet: checksum mismatch (calculated=%u received=%u)\n", (unsigned)(checksum & 0xFF), (unsigned)(unsigned char)input[input_len - 1]);
+        return -1;
+    }
+
+    printf("validate_packet: packet is valid\n");
+    return 0;
+}
+
+uint8_t calc_checksum(Payload* payload, SensorData* sensor) {
+    if (payload == NULL || sensor == NULL) {
+        return 0;
+    }
+
+    uint16_t checksum = 0;
+    checksum += payload->HEADER[0];
+    checksum += payload->HEADER[1];
+    checksum += payload->length;
+    checksum += (uint8_t)(payload->lmid & 0xFF);
+    checksum += (uint8_t)((payload->lmid >> 8) & 0xFF);
+    checksum += payload->scount;
+
+    for (int i = 0; i < payload->scount; i++) {
+        checksum += sensor[i].sid;
+        checksum += sensor[i].type;
+        uint8_t value_len = sensor[i].type & 0x3F;
+        for (int j = 0; j < value_len; j++) {
+            checksum += sensor[i].value[j];
+        }
+    }
+
+    return (uint8_t)(checksum & 0xFF);
+}
+
+int make_payload(Payload* payload) {
+    payload->lmid = lmid_own;
+    payload->scount = scount;
+    SensorData* sensor = (SensorData*)malloc(sizeof(SensorData));
+    if (sensor == NULL) {
+        return 0;
+    }
+    sensor[0].sid = trap.sid;
+    sensor[0].type = trap.type;
+    sensor[0].value = (uint8_t*)malloc(1);
+    if (sensor[0].value == NULL) {
+        free(sensor);
+        return 0;
+    }
+    uint8_t trap_value = sense();
+    sensor[0].value[0] = trap_value;
+    payload->sensor = sensor;
+    payload->length = sizeof(payload->lmid) + sizeof(payload->scount)
+        + sizeof(sensor[0].sid) + sizeof(sensor[0].type) + (trap.type & 0x3F) + sizeof(payload->checksum);
+    payload->checksum = calc_checksum(payload, payload->sensor);
+
+    return 1;
+}
+
+int esp_sleep() {
+    rtc_gpio_init(TRAP_PIN);
+    rtc_gpio_set_direction(TRAP_PIN, RTC_GPIO_MODE_INPUT_ONLY);
+    rtc_gpio_pullup_en(TRAP_PIN);
+    rtc_gpio_pulldown_dis(TRAP_PIN);
+    rtc_gpio_hold_en(TRAP_PIN);
+
+    // ext0はレベル検出なので、HIGHのまま寝ると即復帰する
+    unsigned long wait_start = millis();
+    while (rtc_gpio_get_level(WAKEUP_PIN) == 1 && (millis() - wait_start) < 3000) {
+        delay(10);
+    }
+    if (rtc_gpio_get_level(WAKEUP_PIN) == 1) {
+        Serial.println("Warning: WAKEUP pin still HIGH before sleep");
+    }
+
+    esp_sleep_enable_ext0_wakeup(WAKEUP_PIN, 1);
+    Serial.println("Entering deep sleep...");
+    Serial.printf("esp_sleep (after delay): WAKEUP_PIN level=%d\r\n", rtc_gpio_get_level(WAKEUP_PIN));
+    esp_deep_sleep_start();
+
+    return 1;
+}

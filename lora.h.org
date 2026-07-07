@@ -1,0 +1,46 @@
+#ifndef LORA_H
+#define LORA_H
+
+extern const int BAUDRATE;
+static const uint8_t HEADER[2] = {'T', 'G'};
+
+enum Endian {
+    LITTLE = 0,
+    BIG = 1
+};
+
+struct SensorData {
+    uint8_t sid; // センサID
+    uint8_t type; // データタイプ
+    uint8_t* value; // センサ値
+};
+
+struct Payload {
+    const uint8_t HEADER[2] = {'T', 'G'};
+    uint8_t length;
+    uint16_t lmid;
+    uint8_t scount;
+    SensorData* sensor;
+    uint8_t checksum;
+};
+
+// LoRaモジュールに依存する関数
+extern void lora_serial_begin(); // シリアル通信の初期化
+extern int initialize_lora_module(int lid); // モジュールの初期化
+extern int send_preamble(); // プリアンブルの送信
+extern int recv_preamble(); // プリアンブルの受信
+extern int recv_serial_until_timeout(char* buffer, size_t buffer_size, uint32_t timeout_ms); // タイムアウト付きでシリアルデータを受信
+extern int hex_decode(const char* input, size_t input_len, uint8_t* output, size_t output_size); // 16進文字列のデコード
+extern void set_payload(Payload* payload); // ペイロードのセット
+extern int send(); // データの送信
+extern void flush_buffer(); // シリアルバッファのフラッシュ
+extern void execute_command(const char* command); // コマンドの送信
+extern void execute_command_fmt(const char* prefix, int value); // フォーマット付きコマンド送信
+extern void send_break_signal(); // ブレーク信号の送信
+extern void set_destination(int dst_id);
+extern void set_payload(Payload* payload);
+
+// プロジェクトに依存する関数
+extern int esp_sleep(); // ESP32のスリープ
+
+#endif

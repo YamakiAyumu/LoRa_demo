@@ -1,0 +1,234 @@
+#include <Arduino.h>
+#include <ctype.h>
+#include "lora.h"
+#include "lra1_program.h"
+
+#define BAUDRATE 115200
+#define UART_TX 17
+#define UART_RX 16
+#define SF 7
+#define BW 7
+#define CR 1
+
+/**
+ * @brief LoRa UARTの初期化
+ */
+void lora_serial_begin() {
+    Serial2.begin(BAUDRATE, SERIAL_8N1, UART_RX, UART_TX);
+}
+
+/**
+ * @brief フラッシュプログラミング
+ */
+void flash_program() {
+    execute_command("EDIT 1");
+    execute_command("NEW");
+
+    String program = LRA1_PROGRAM;
+    int start = 0;
+    int end = program.indexOf('\n');
+    
+    while (end >= 0) {
+        String line = program.substring(start, end);
+        line.trim();
+        if (line.length() > 0) {
+            execute_command(line.c_str());
+        }
+        start = end + 1;
+        end = program.indexOf('\n', start);
+    }
+
+    execute_command("EDIT 0");
+}
+
+/**
+ * @brief 初期化
+ * @param lid ローカルID
+ * @return 成功した場合は1、失敗した場合は0
+ */
+int initialize_lora_module(int lid) {
+    execute_command_fmt("OWN=", lid);
+    execute_command_fmt("SF=", SF);
+    execute_command_fmt("BW=", BW);
+    execute_command_fmt("CR=", CR);
+    
+    execute_command("CTRL=7");
+    execute_command("ECHO=0");
+    
+    flash_program();
+
+    return 1;
+}
+
+/**
+ * @brief 送信プリアンブルの送信
+ * @return 成功した場合は1、失敗した場合は0
+ */
+int send_preamble() {
+    execute_command("TXWAVE 1200");
+    
+    return 1;
+}
+
+/**
+ * @brief 受信プリアンブルの受信
+ * @return 成功した場合は1、失敗した場合は0
+ */
+int recv_preamble() {
+    execute_command("RUN");
+    Serial.println("Running...");
+
+    return 1;
+}
+
+int recv_serial_until_timeout(char *buffer, size_t buffer_size, uint32_t timeout_ms) {
+    if (buffer == NULL || buffer_size == 0) {
+        return -1;
+    }
+
+    flush_buffer();
+
+    char cmd[32];
+    sprintf(cmd, "RECV -%u,$$", timeout_ms);
+    execute_command(cmd);
+
+    char raw_buffer[256];
+    unsigned long timeout = millis() + timeout_ms;
+    int len = 0;
+
+    while (millis() < timeout) {
+        if (Serial2.available()) {
+            int len = Serial2.readBytesUntil('\r', raw_buffer, sizeof(raw_buffer) - 1);
+            if (len > 0) {
+                break;
+            }
+        }
+    }
+    
+    if (len % 2 != 0) {
+        printf("recv_serial_until_timeout: received data length must be even (len=%d)\n", len);
+        return -1;
+    }
+
+    raw_buffer[len] = '\0';
+    Serial.printf("[LRA1 RX] %s\r\n", raw_buffer);
+
+    int decoded_len = hex_decode(raw_buffer, len, (uint8_t*)buffer, buffer_size);
+    if (decoded_len < 0) {
+        return -1;
+    }
+
+    return decoded_len;
+
+    // 以下プロジェクトファイルに移植
+    long ack_value = strtol(ack_hex, NULL, 16);
+    if (ack_value == 0x06) {
+        return 1;
+    } else {
+        continue;
+    }
+}
+
+int hex_decode(const char *input, size_t input_len, uint8_t *output, size_t output_size) {
+    if ((input_len % 2) != 0) {
+        printf("hex_decode: input length must be even (input_len=%zu)\n", input_len);
+        return -1;
+    }
+
+    size_t required_size = input_len / 2;
+    if (output_size < required_size) {
+        printf("hex_decode: output buffer too small (required=%zu)\n", required_size);
+        return -1;
+    }
+
+    for (size_t i = 0; i < required_size; i++) {
+        unsigned int value;
+        if (sscanf(input + i * 2, "%2x", &value) != 1) {
+            printf("hex_decode: failed to parse hex at position %zu\n", i * 2);
+            return -1;
+        }
+        output[i] = (uint8_t)value;
+    }
+
+    return (int)required_size;
+}
+
+void set_payload(Payload* payload) {
+    execute_command_fmt("TXD(7)=", sizeof(payload->HEADER) + sizeof(payload->length) + payload->length);
+    execute_command_fmt("TXD(8)=", payload->HEADER[0]);
+    execute_command_fmt("TXD(9)=", payload->HEADER[1]);
+    execute_command_fmt("TXD(10)=", payload->length);
+    execute_command_fmt("TXDW(11)=", payload->lmid);
+    execute_command_fmt("TXD(13)=", payload->scount);
+    // センサデータの送信
+    int offset = 14;
+    for (int i = 0; i < payload->scount; i++) {
+        SensorData* sensor = &payload->sensor[i];
+        char cmd[16];
+        sprintf(cmd, "TXD(%d)=", offset++);
+        execute_command_fmt(cmd, sensor[i].sid);
+        sprintf(cmd, "TXD(%d)=", offset++);
+        execute_command_fmt(cmd, sensor[i].type);
+        uint8_t value_len = sensor[i].type & 0x3F;
+        for (int j = 0; j < value_len; j++) {
+            sprintf(cmd, "TXD(%d)=", offset++);
+            execute_command_fmt(cmd, sensor[i].value[j]);
+        }
+    }
+    char cmd[16];
+    sprintf(cmd, "TXD(%d)=", offset);
+    execute_command_fmt(cmd, payload->checksum);
+}
+
+int send() {
+    execute_command("SEND");
+    return 1;
+}
+
+/**
+ * @brief バッファ内の不要なデータを捨てる
+ */
+void flush_buffer() {
+    while(Serial2.available()) {
+        Serial2.read();
+    }
+}
+
+/**
+ * @brief コマンドを実行する
+ * @param cmd 実行するコマンド
+ */
+void execute_command(const char* cmd) {
+    Serial.printf("[LRA1] %s\r\n", cmd);
+    Serial2.printf("%s\r", cmd);
+    Serial2.flush();
+    delay(10);
+}
+
+/**
+ * @brief フォーマット付きでコマンドを実行する
+ * @param param パラメータ
+ * @param value 値
+ */
+void execute_command_fmt(const char* param, int value) {
+    char buf[32];
+    sprintf(buf, "%s%d", param, value);
+    execute_command(buf);
+}
+
+void send_break_signal() {
+    Serial2.end();
+    pinMode(17, OUTPUT);
+    digitalWrite(17, LOW);
+    delay(20);
+    lora_serial_begin();
+    delay(100);
+}
+
+/**
+ * @brief 送信先のLMIDを設定する
+ * @param dst_id 送信先のLMID
+ */
+void set_destination(int dst_id) {
+    execute_command_fmt("DST=", dst_id);
+}

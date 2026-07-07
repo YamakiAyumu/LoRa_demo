@@ -1,130 +1,158 @@
 #include <stdio.h>
-#include <string.h>
 #include "pico/stdlib.h"
 #include "hardware/uart.h"
 #include "hardware/gpio.h"
-#include "lora.h"
 
-uint baudrate = 115200;
-uart_inst_t* uart_id = uart0;
+#define LORA_BUFFER_INIT_INDEX 7
 
-const int sf = 7;
-const int bw = 7;
-const int cr = 1;
 
-void lora_serial_begin() {
-    uart_init(uart_id, baudrate);
-    gpio_set_function(0, GPIO_FUNC_UART);
-    gpio_set_function(1, GPIO_FUNC_UART);
+static Serial2 serial2;
+static const int baudrate = 115200;
+static const uint8_t sf = 7;
+static const uint8_t bw = 7;
+static const uint8_t cr = 1;
+static size_t buffer_index;
 
-    uart_set_format(uart_id, 8, 1, UART_PARITY_NONE);
-    uart_set_hw_flow(uart_id, false, false);
+static void execute_command(const char* cmd);
+static void execute_command_fmt(const char* param, int value);
+static void flush_buffer();
+
+void config_controller() {
+    setCpuFrequencyMhz(80);
+
+    const int pins_to_disable[] = {0, 2, 4, 12, 13, 14, 15, 18, 19, 21, 22, 23, 25, 27, 32};
+    for (int pin : pins_to_disable) {
+        pinMode(pin, INPUT_PULLDOWN);
+    }
+
+    esp_wifi_stop();
+    esp_wifi_deinit();
+
+    btStop();
+    esp_bluedroid_disable();
+    esp_bluedroid_deinit();
+    esp_bt_controller_disable();
+    esp_bt_controller_deinit();
+    
+    rtc_gpio_init(WAKEUP_PIN);
+    rtc_gpio_set_direction(WAKEUP_PIN, RTC_GPIO_MODE_INPUT_ONLY);
+    rtc_gpio_pullup_dis(WAKEUP_PIN);
+    rtc_gpio_pulldown_en(WAKEUP_PIN);
+
+    Serial.begin(115200);
 }
 
-int initialize_lora_module() {
-    execute_command("OWN=0");
-    execute_command("SF=7");
-    execute_command("BW=7");
-    execute_command("CR=1");
+void config_lora_module(uint16_t own) {
+    execute_command_fmt("SF=", sf);
+    execute_command_fmt("BW=", bw);
+    execute_command_fmt("CR=", cr);
+    execute_command_fmt("OWN=", own);
+
     execute_command("CTRL=7");
     execute_command("ECHO=0");
 
     flush_buffer();
-
-    return 0;
 }
 
-void flush_buffer() {
-    absolute_time_t idle_deadline = make_timeout_time_ms(10);
-    absolute_time_t max_deadline = make_timeout_time_ms(100);
-    while (!time_reached(max_deadline)) {
-        bool any = false;
+void config_serial(void *comm_port, const int uart_tx_pin, const int uart_rx_pin) {
+    serial2 = (Serial2)comm_port;
+    serial2.begin(baudrate, SERIAL_8N1, uart_rx_pin, uart_tx_pin);
+}
+
+void set_dst(uint16_t dst) {
+    execute_command_fmt("DST=", dst);
+}
+
+void set_gid(uint16_t gid) {
+    execute_command_fmt("GID=", gid);
+}
+
+void send_preamble(uint32_t time_ms) {
+    execute_command_fmt("TXWAVE %u", time_ms);
+}
+
+void open_tx_buffer() {
+    buffer_index = LORA_BUFFER_INIT_INDEX;
+}
+
+void set_tx_byte(uint8_t data) {
+    char cmd[32];
+    sprintf(cmd, "TXD(%u)=%u", buffer_index, data);
+    execute_command(cmd);
+    buffer_index++;
+}
+
+void set_tx_word(uint16_t data) {
+    char cmd[32];
+    sprintf(cmd, "TXDW(%u)=%u", buffer_index, data);
+    execute_command(cmd);
+    buffer_index += 2;
+}
+
+void send_packet() {
+    execute_command("SEND");
+}
+
+int recv_packet(char *raw_buffer, size_t raw_buffer_size,uint32_t timeout_ms) {
+    char cmd[32];
+    sprintf(cmd, "RECV -%u,$$", timeout_ms);
+    execute_command(cmd);
+
+    int index = 0;
+    absolute_time_t deadline = make_timeout_time_ms(timeout_ms);
+
+    while (!time_reached(deadline)) {
         while (uart_is_readable(uart_id)) {
-            uart_getc(uart_id);
-            any = true;
+            char c = uart_getc(uart_id);
+            if (index < (sizeof(raw_buffer) - 1)) {
+                raw_buffer[index++] = c;
+            }
         }
-        if (!any && time_reached(idle_deadline)) {
+
+        if (index > 0 && raw_buffer[index - 1] == '\r') {
+            index--;
             break;
         }
-        if (any) {
-            idle_deadline = make_timeout_time_ms(10);
-        }
     }
+
+    if (index % 2 != 0) {
+        printf("[lora] recv_packet: invalid length=%d\n", index);
+        return -1;
+    }
+
+    raw_buffer[index] = '\0';
+    return index;
 }
 
-void execute_command(const char* cmd) {
+static void execute_command(const char* cmd) {
+    flush_buffer();
+
     printf("[lora] execute_command: '%s'\n", cmd);
     uart_puts(uart_id, cmd);
     uart_putc(uart_id, '\r');
     sleep_ms(10);
 }
 
-void execute_command_fmt(const char* param, int value) {
+static void execute_command_fmt(const char* param, int value) {
     char buf[32];
     sprintf(buf, "%s%d", param, value);
     execute_command(buf);
 }
 
-int receive_serial_until_timeout(char *buffer, size_t buffer_size, uint32_t timeout_ms) {
-    if (buffer == NULL || buffer_size == 0) {
-        printf("[lora] receive_serial_until_timeout: invalid buffer or size\n");
-        return -1;
-    }
-
-    memset(buffer, 0, buffer_size);
-    int index = 0;
-    absolute_time_t deadline = make_timeout_time_ms(timeout_ms);
-    printf("[lora] receive_serial_until_timeout: start timeout=%u buffer_size=%zu\n", timeout_ms, buffer_size);
-
-    while (!time_reached(deadline)) {
+static void flush_buffer() {
+    absolute_time_t idle_deadline = make_timeout_time_ms(2);
+    absolute_time_t max_deadline = make_timeout_time_ms(20);
+    while (!time_reached(max_deadline)) {
+        bool has_received = false;
         while (uart_is_readable(uart_id)) {
-            char c = (char)uart_getc(uart_id);
-            if (index < (buffer_size - 1)) {
-                buffer[index++] = c;
-                unsigned char uc = (unsigned char)c;
-                if (uc >= 32 && uc <= 126) {
-                    printf("[lora] read[%d]=0x%02x '%c'\n", index - 1, uc, c);
-                } else {
-                    printf("[lora] read[%d]=0x%02x\n", index - 1, uc);
-                }
-            } else {
-                printf("[lora] buffer full, dropping byte 0x%02x\n", (unsigned char)c);
-            }
+            uart_getc(uart_id);
+            has_received = true;
         }
-
-        if (index > 0 && buffer[index - 1] == '\r') {
-            printf("[lora] received CR, end of packet\n");
-            // strip the CR from the returned data length
-            index--;
+        if (!has_received && time_reached(idle_deadline)) {
             break;
         }
+        if (has_received) {
+            idle_deadline = make_timeout_time_ms(2);
+        }
     }
-
-    if ((index % 2) != 0 || index < 20) {
-        printf("[lora] receive_serial_until_timeout: invalid length=%d\n", index);
-        return -1;
-    }
-
-    buffer[index] = '\0';
-    printf("[lora] receive_serial_until_timeout: success len=%d\n", index);
-    return index;
-}
-
-int send_ack() {
-    execute_command("TXD(7)=1");
-    execute_command("TXD(8)=6");
-    for (int i = 0; i < 3; i++) {
-        execute_command("SEND");
-        sleep_ms(100);
-    }
-
-    return 0;
-}
-
-void set_dst(int dst) {
-    execute_command_fmt("DST=", dst);
-}
-
-void set_gid(int gid) {
-    execute_command_fmt("GID=", gid);
 }
